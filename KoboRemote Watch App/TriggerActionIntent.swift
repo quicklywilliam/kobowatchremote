@@ -7,7 +7,6 @@ struct TriggerActionIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        BLEManager.shared.sendNextPage()
         ActionState.shared.trigger()
         return .result()
     }
