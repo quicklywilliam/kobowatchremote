@@ -35,21 +35,60 @@ final class BLEManager: NSObject {
         centralManager = CBCentralManager(delegate: self, queue: nil)
     }
 
-    func sendNextPage() {
-        write(command: Self.nextPage)
-        lastAction = "Next →"
-        clearAction()
+    var isConnected: Bool { state == .connected }
+
+    func sendNextPage(completion: ((Bool) -> Void)? = nil) {
+        sendCommand(Self.nextPage, label: "Next →", completion: completion)
     }
 
-    func sendPreviousPage() {
-        write(command: Self.previousPage)
-        lastAction = "← Prev"
-        clearAction()
+    func sendPreviousPage(completion: ((Bool) -> Void)? = nil) {
+        sendCommand(Self.previousPage, label: "← Prev", completion: completion)
     }
 
-    private func write(command: UInt8) {
-        guard let peripheral, let characteristic else { return }
-        peripheral.writeValue(Data([command]), for: characteristic, type: .withResponse)
+    private func sendCommand(_ command: UInt8, label: String, completion: ((Bool) -> Void)?) {
+        if let peripheral, let characteristic {
+            peripheral.writeValue(Data([command]), for: characteristic, type: .withResponse)
+            lastAction = label
+            clearAction()
+            completion?(true)
+        } else {
+            // Queue command and attempt reconnect
+            lastAction = "Connecting…"
+            pendingCommand = (command, label, completion)
+            attemptReconnectWithTimeout()
+        }
+    }
+
+    private var pendingCommand: (command: UInt8, label: String, completion: ((Bool) -> Void)?)?
+    private var reconnectTimeoutTask: Task<Void, Never>?
+
+    private func attemptReconnectWithTimeout() {
+        // If already scanning/connecting, just set the timeout
+        if state == .disconnected {
+            startScanning()
+        }
+        reconnectTimeoutTask?.cancel()
+        reconnectTimeoutTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            // Timed out — flush pending command as failure
+            if let pending = pendingCommand {
+                lastAction = "Failed"
+                clearAction()
+                pending.completion?(false)
+                pendingCommand = nil
+            }
+        }
+    }
+
+    fileprivate func flushPendingCommand() {
+        guard let pending = pendingCommand, let peripheral, let characteristic else { return }
+        reconnectTimeoutTask?.cancel()
+        peripheral.writeValue(Data([pending.command]), for: characteristic, type: .withResponse)
+        lastAction = pending.label
+        clearAction()
+        pending.completion?(true)
+        pendingCommand = nil
     }
 
     private func clearAction() {
@@ -138,5 +177,6 @@ extension BLEManager: CBPeripheralDelegate {
         }
         characteristic = char
         state = .connected
+        flushPendingCommand()
     }
 }

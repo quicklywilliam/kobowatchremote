@@ -7,7 +7,12 @@
  *
  * On write to the characteristic:
  *   0x01 = next page, 0x02 = previous page
- * These are injected as physical key events on /dev/input/event0.
+ * These are sent over a Unix socket to the NickelHook plugin which
+ * calls ReadingView::nextPage()/prevPage() directly.
+ *
+ * The main thread blocks on the socket waiting for commands from the
+ * plugin. On device resume, the plugin sends CMD_HEALTH_CHECK (0xFF);
+ * ble_peripheral tests the BT stack and exits if stale (reaper respawns).
  */
 
 #include <stdio.h>
@@ -16,10 +21,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <dlfcn.h>
-#include <fcntl.h>
-#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <pthread.h>
-#include <linux/input.h>
+#include <errno.h>
+#include <time.h>
 
 /* Type definitions matching MediaTek BT MW */
 typedef unsigned char  UINT8;
@@ -148,8 +154,7 @@ typedef struct {
     BtAppGATTSIndSentCbk   bt_gatts_ind_sent_cb;
 } MTKRPCAPI_BT_APP_GATTS_CB_FUNC_T;
 
-/* GATTC callback types - all 16 slots must be populated to avoid SIGSEGV
- * when the RPC dispatcher invokes callbacks by index */
+/* GATTC callback types - all 16 slots must be populated */
 typedef enum {
     BT_GATTC_REGISTER_APP = 0,
     BT_GATTC_SCAN_RESULT,
@@ -168,22 +173,22 @@ typedef VOID (*BtAppGATTCRegClientCbk)(BT_GATTC_REG_CLIENT_RST_T *rst, void* pv_
 typedef VOID (*BtAppGATTCGenericCbk)(void *rst, void* pv_tag);
 
 typedef struct {
-    BtAppGATTCEventCbk       bt_gattc_event_cb;           /*  1 event */
-    BtAppGATTCRegClientCbk   bt_gattc_reg_client_cb;      /*  2 reg_client */
-    BtAppGATTCGenericCbk     bt_gattc_scan_cb;            /*  3 scan_result */
-    BtAppGATTCGenericCbk     bt_gattc_get_gatt_db_cb;     /*  4 get_gatt_db */
-    BtAppGATTCGenericCbk     bt_gattc_get_reg_noti_cb;    /*  5 get_reg_noti */
-    BtAppGATTCGenericCbk     bt_gattc_notify_cb;          /*  6 notify */
-    BtAppGATTCGenericCbk     bt_gattc_read_char_cb;       /*  7 read_char */
-    BtAppGATTCGenericCbk     bt_gattc_write_char_cb;      /*  8 write_char */
-    BtAppGATTCGenericCbk     bt_gattc_read_desc_cb;       /*  9 read_desc */
-    BtAppGATTCGenericCbk     bt_gattc_write_desc_cb;      /* 10 write_desc */
-    BtAppGATTCGenericCbk     bt_gattc_scan_filt_param_cb; /* 11 scan_filter_param */
-    BtAppGATTCGenericCbk     bt_gattc_scan_filt_status_cb;/* 12 scan_filter_status */
-    BtAppGATTCGenericCbk     bt_gattc_scan_filt_cfg_cb;   /* 13 scan_filter_cfg */
-    BtAppGATTCGenericCbk     bt_gattc_adv_cb;             /* 14 adv_enable */
-    BtAppGATTCGenericCbk     bt_gattc_mtu_config_cb;      /* 15 mtu_config */
-    BtAppGATTCGenericCbk     bt_gattc_phy_updated_cb;     /* 16 phy_updated */
+    BtAppGATTCEventCbk       bt_gattc_event_cb;
+    BtAppGATTCRegClientCbk   bt_gattc_reg_client_cb;
+    BtAppGATTCGenericCbk     bt_gattc_scan_cb;
+    BtAppGATTCGenericCbk     bt_gattc_get_gatt_db_cb;
+    BtAppGATTCGenericCbk     bt_gattc_get_reg_noti_cb;
+    BtAppGATTCGenericCbk     bt_gattc_notify_cb;
+    BtAppGATTCGenericCbk     bt_gattc_read_char_cb;
+    BtAppGATTCGenericCbk     bt_gattc_write_char_cb;
+    BtAppGATTCGenericCbk     bt_gattc_read_desc_cb;
+    BtAppGATTCGenericCbk     bt_gattc_write_desc_cb;
+    BtAppGATTCGenericCbk     bt_gattc_scan_filt_param_cb;
+    BtAppGATTCGenericCbk     bt_gattc_scan_filt_status_cb;
+    BtAppGATTCGenericCbk     bt_gattc_scan_filt_cfg_cb;
+    BtAppGATTCGenericCbk     bt_gattc_adv_cb;
+    BtAppGATTCGenericCbk     bt_gattc_mtu_config_cb;
+    BtAppGATTCGenericCbk     bt_gattc_phy_updated_cb;
 } MTKRPCAPI_BT_APP_GATTC_CB_FUNC_T;
 
 /* Function pointer types for dlsym */
@@ -205,14 +210,14 @@ typedef INT32 (*fn_gattc_multi_adv_enable)(INT32 client_if, INT32 min_interval, 
 typedef INT32 (*fn_gattc_multi_adv_setdata)(INT32 client_if, UINT8 set_scan_rsp, UINT8 include_name, UINT8 include_txpower, INT32 appearance, INT32 manufacturer_len, CHAR* manufacturer_data, INT32 service_data_len, CHAR* service_data, INT32 service_uuid_len, CHAR* service_uuid);
 typedef INT32 (*fn_gattc_multi_adv_disable)(INT32 client_if);
 
-/* BLE 5.0 Advertising Set API structs (reverse-engineered from RPC descriptors) */
+/* BLE 5.0 Advertising Set API structs */
 struct __attribute__((packed)) AdvSetParams {
-    UINT16 advertising_event_properties;  /* bit4=legacy, bit1=scannable, bit0=connectable */
-    UINT32 min_interval;                  /* in 0.625ms units */
+    UINT16 advertising_event_properties;
+    UINT32 min_interval;
     UINT32 max_interval;
-    UINT8  channel_map;                   /* 7 = all channels */
-    UINT8  tx_power;                      /* signed, transmit power in dBm */
-    UINT8  primary_advertising_phy;       /* 1=LE_1M */
+    UINT8  channel_map;
+    UINT8  tx_power;
+    UINT8  primary_advertising_phy;
     UINT8  secondary_advertising_phy;
 };
 
@@ -241,20 +246,33 @@ typedef INT32 (*fn_gattc_stop_adv_set)(INT32 client_if);
 
 /* Globals */
 static volatile int g_running = 1;
+static volatile int g_health_fail = 0;
 static volatile INT32 g_server_if = -1;
 static volatile INT32 g_client_if = -1;
 static volatile INT32 g_srvc_handle = -1;
 static volatile INT32 g_char_handle = -1;
+static volatile INT32 g_descr_handle = -1;
 static volatile INT32 g_conn_id = -1;
+static volatile INT32 g_srvc_started = -1; /* set to 0+ by op_srvc_cb */
+
+/* Wait for a volatile INT32 to change from -1, polling every 50ms.
+ * Returns 1 on success, 0 on timeout. */
+static int wait_for(volatile INT32 *var, int timeout_ms) {
+    struct timespec ts = { 0, 50000000 }; /* 50ms */
+    for (int elapsed = 0; elapsed < timeout_ms; elapsed += 50) {
+        if (*var >= 0) return 1;
+        nanosleep(&ts, NULL);
+    }
+    return *var >= 0;
+}
 
 /* Page turn commands */
 #define CMD_NEXT_PAGE  0x01
 #define CMD_PREV_PAGE  0x02
 
-/* Kobo physical page buttons on /dev/input/event0 (gpio-keys) */
-#define KEY_F23  193   /* page back */
-#define KEY_F24  194   /* page forward */
-#define INPUT_DEV "/dev/input/event0"
+/* Health check command (sent by plugin on resume) */
+#define CMD_HEALTH_CHECK 0xFF
+#define EXIT_HEALTH_FAIL 42
 
 static UINT8 g_last_cmd = 0;
 
@@ -270,42 +288,32 @@ static UINT8 g_last_cmd = 0;
 #define GATT_PERM_READ       0x01
 #define GATT_PERM_WRITE      0x10
 
-/* Function pointers stored globally for use in callbacks and sleep handler */
+/* Function pointers stored globally for use in callbacks */
 static fn_gatts_send_response g_send_response = NULL;
 static fn_gatts_stop_service g_stop_service = NULL;
-static fn_gatts_start_service g_start_service = NULL;
 static fn_gattc_start_adv_set g_start_adv_set = NULL;
 static fn_gattc_stop_adv_set g_stop_adv_set = NULL;
 static fn_gattc_multi_adv_enable g_multi_adv_enable = NULL;
 static fn_gattc_multi_adv_setdata g_multi_adv_setdata = NULL;
 static fn_gattc_multi_adv_disable g_multi_adv_disable = NULL;
 
-/* --- Input injection --- */
+/* Library handle for reinit */
+static void *g_lib = NULL;
 
-static void emit_input(int fd, unsigned short type, unsigned short code, int value) {
-    struct input_event ev;
-    memset(&ev, 0, sizeof(ev));
-    gettimeofday(&ev.time, NULL);
-    ev.type = type;
-    ev.code = code;
-    ev.value = value;
-    write(fd, &ev, sizeof(ev));
-}
+/* Unix socket to NickelHook plugin */
+#define SOCKET_PATH "/tmp/kobo-ble-remote.sock"
+static int g_sock_fd = -1;
 
-static void inject_page_turn(int forward) {
-    int fd = open(INPUT_DEV, O_WRONLY);
-    if (fd < 0) {
-        printf("[PAGE] Failed to open %s\n", INPUT_DEV);
-        return;
+/* --- Socket IPC to NickelHook plugin --- */
+
+static void send_command(UINT8 cmd) {
+    if (g_sock_fd < 0) return;
+    ssize_t n = write(g_sock_fd, &cmd, 1);
+    if (n != 1) {
+        printf("[SOCK] write failed: %s\n", n < 0 ? strerror(errno) : "short write");
+        close(g_sock_fd);
+        g_sock_fd = -1;
     }
-    unsigned short key = forward ? KEY_F24 : KEY_F23;
-    emit_input(fd, EV_KEY, key, 1);
-    emit_input(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(50000);
-    emit_input(fd, EV_KEY, key, 0);
-    emit_input(fd, EV_SYN, SYN_REPORT, 0);
-    close(fd);
-    printf("[PAGE] Injected %s page turn\n", forward ? "NEXT" : "PREV");
 }
 
 /* --- Advertising helpers --- */
@@ -313,9 +321,7 @@ static void inject_page_turn(int forward) {
 static void build_adv_data(struct AdvSetData *ad) {
     memset(ad, 0, sizeof(*ad));
     UINT8 *p = ad->data;
-    /* Flags: LE General Discoverable + BR/EDR Not Supported */
     *p++ = 0x02; *p++ = 0x01; *p++ = 0x06;
-    /* Complete 128-bit service UUID (little-endian) */
     *p++ = 0x11; *p++ = 0x07;
     *p++ = 0x46; *p++ = 0x4b; *p++ = 0xd6; *p++ = 0xe0;
     *p++ = 0x24; *p++ = 0x46; *p++ = 0xbb; *p++ = 0xa1;
@@ -327,7 +333,6 @@ static void build_adv_data(struct AdvSetData *ad) {
 static void build_scan_rsp(struct AdvSetData *sr) {
     memset(sr, 0, sizeof(*sr));
     UINT8 *p = sr->data;
-    /* Complete Local Name: "Kobo Libra Colour" */
     *p++ = 18; *p++ = 0x09;
     memcpy(p, "Kobo Libra Colour", 17);
     p += 17;
@@ -338,42 +343,34 @@ static INT32 start_legacy_advertising(void) {
     if (g_client_if < 0) return -1;
     INT32 ret;
 
-    /* Step 1: Start multi_adv to prime the advertising instance.
-     * multi_adv alone produces extended ADV_EXT_IND (visible on iPhone/Mac
-     * but NOT on Apple Watch). However it seems to be required to initialize
-     * the advertising state before start_advertising_set will work. */
     if (g_multi_adv_enable) {
         printf("Priming with multi_adv (client_if=%d)...\n", g_client_if);
         ret = g_multi_adv_enable(g_client_if, 96, 160, 0, 7, 7, 0);
         printf("multi_adv_enable: ret=%d\n", ret);
         if (ret == 0) {
-            sleep(1);
-            /* Set advertising data */
+            usleep(200000);
             g_multi_adv_setdata(g_client_if,
                 0, 1, 0, 0, 0, NULL, 0, NULL,
                 strlen(SERVICE_UUID), SERVICE_UUID);
             g_multi_adv_setdata(g_client_if,
                 1, 1, 0, 0, 0, NULL, 0, NULL,
                 strlen(SERVICE_UUID), SERVICE_UUID);
-            sleep(1);
-            /* Stop multi_adv before switching to adv_set */
+            usleep(200000);
             g_multi_adv_disable(g_client_if);
-            sleep(1);
+            usleep(200000);
         }
     }
 
-    /* Step 2: Start legacy advertising via start_advertising_set.
-     * evt_props=0x0013 forces legacy ADV_IND PDUs which Apple Watch can see. */
     if (!g_start_adv_set) return -1;
 
     struct AdvSetParams ap;
     memset(&ap, 0, sizeof(ap));
-    ap.advertising_event_properties = 0x0013; /* legacy + connectable + scannable */
-    ap.min_interval = 96;   /* 60ms */
-    ap.max_interval = 160;  /* 100ms */
-    ap.channel_map = 7;     /* all channels */
+    ap.advertising_event_properties = 0x0013;
+    ap.min_interval = 96;
+    ap.max_interval = 160;
+    ap.channel_map = 7;
     ap.tx_power = 7;
-    ap.primary_advertising_phy = 1;   /* LE 1M */
+    ap.primary_advertising_phy = 1;
     ap.secondary_advertising_phy = 1;
 
     struct AdvSetData ad, sr, pd;
@@ -390,102 +387,60 @@ static INT32 start_legacy_advertising(void) {
     return ret;
 }
 
-/* --- Power button monitoring for sleep/wake --- */
-
-#define POWER_BTN_DEV "/dev/input/event3"
-#define KEY_POWER 116
-
-static volatile int g_suspended = 0;
-
-static void bt_teardown_for_sleep(void) {
-    printf("[SLEEP] Tearing down BT for suspend...\n");
-    if (g_stop_adv_set && g_client_if >= 0)
-        g_stop_adv_set(g_client_if);
-    if (g_stop_service && g_server_if >= 0 && g_srvc_handle >= 0)
-        g_stop_service(g_server_if, g_srvc_handle);
-    printf("[SLEEP] BT teardown complete\n");
-}
-
-static void bt_restore_after_wake(void) {
-    printf("[WAKE] Restoring BT after resume...\n");
-    if (g_start_service && g_server_if >= 0 && g_srvc_handle >= 0)
-        g_start_service(g_server_if, g_srvc_handle, 2);
-    start_legacy_advertising();
-    sleep(2);
-    printf("[WAKE] BT restore complete\n");
-}
-
-static void *power_button_monitor(void *arg) {
-    struct input_event ev;
-    int fd = open(POWER_BTN_DEV, O_RDONLY);
-    if (fd < 0) {
-        printf("[PWR] Failed to open %s\n", POWER_BTN_DEV);
-        return NULL;
-    }
-    printf("[PWR] Monitoring power button on %s\n", POWER_BTN_DEV);
-
-    while (g_running) {
-        int n = read(fd, &ev, sizeof(ev));
-        if (n != sizeof(ev)) continue;
-        if (ev.type != EV_KEY || ev.code != KEY_POWER) continue;
-
-        if (ev.value == 1) {
-            if (!g_suspended) {
-                g_suspended = 1;
-                bt_teardown_for_sleep();
-            } else {
-                g_suspended = 0;
-                sleep(3);
-                bt_restore_after_wake();
-            }
-        }
-    }
-    close(fd);
-    return NULL;
-}
-
 /* --- GATTS Callbacks --- */
 
 static void gatts_event_cb(BT_GATTS_EVENT_T event, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Event: %d\n", event);
     if (event == BT_GATTS_CONNECT) {
         printf("[GATTS] *** Device connected! ***\n");
     } else if (event == BT_GATTS_DISCONNECT) {
         printf("[GATTS] *** Device disconnected ***\n");
         g_conn_id = -1;
+        printf("[GATTS] Restarting advertising...\n");
+        start_legacy_advertising();
     }
 }
 
 static void gatts_reg_server_cb(BT_GATTS_REG_SERVER_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Server registered: server_if=%d uuid=%s\n", rst->server_if, rst->app_uuid);
     g_server_if = rst->server_if;
 }
 
 static void gatts_add_srvc_cb(BT_GATTS_ADD_SRVC_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Service added: srvc_handle=%d\n", rst->srvc_handle);
     g_srvc_handle = rst->srvc_handle;
 }
 
 static void gatts_add_incl_cb(BT_GATTS_ADD_INCL_RST_T *rst, void* pv_tag) {
-    (void)rst;
+    (void)rst; (void)pv_tag;
 }
 
 static void gatts_add_char_cb(BT_GATTS_ADD_CHAR_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Char added: uuid=%s char_handle=%d\n", rst->uuid, rst->char_handle);
     g_char_handle = rst->char_handle;
 }
 
 static void gatts_add_desc_cb(BT_GATTS_ADD_DESCR_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Descriptor added: uuid=%s descr_handle=%d\n", rst->uuid, rst->descr_handle);
+    g_descr_handle = rst->descr_handle;
 }
 
 static void gatts_op_srvc_cb(BT_GATTS_SRVC_OP_TYPE_T op, BT_GATTS_SRVC_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     const char *ops[] = {"START", "STOP", "DELETE"};
     printf("[GATTS] Service op: %s srvc_handle=%d\n",
            op < 3 ? ops[op] : "?", rst->srvc_handle);
+    if (op == 0) /* START */
+        g_srvc_started = rst->srvc_handle;
 }
 
 static void gatts_req_read_cb(BT_GATTS_REQ_READ_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Read request from %s\n", rst->btaddr);
     g_conn_id = rst->conn_id;
 
@@ -497,16 +452,17 @@ static void gatts_req_read_cb(BT_GATTS_REQ_READ_RST_T *rst, void* pv_tag) {
 }
 
 static void gatts_req_write_cb(BT_GATTS_REQ_WRITE_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTS] Write request: len=%d from %s\n", rst->length, rst->btaddr);
     g_conn_id = rst->conn_id;
 
     if (rst->length >= 1) {
         UINT8 cmd = rst->value[0];
         g_last_cmd = cmd;
-        if (cmd == CMD_NEXT_PAGE) {
-            inject_page_turn(1);
-        } else if (cmd == CMD_PREV_PAGE) {
-            inject_page_turn(0);
+        if (cmd == CMD_NEXT_PAGE || cmd == CMD_PREV_PAGE) {
+            printf("[PAGE] Sending %s command to plugin\n",
+                   cmd == CMD_NEXT_PAGE ? "NEXT" : "PREV");
+            send_command(cmd);
         }
     }
 
@@ -517,27 +473,29 @@ static void gatts_req_write_cb(BT_GATTS_REQ_WRITE_RST_T *rst, void* pv_tag) {
 }
 
 static void gatts_ind_sent_cb(INT32 conn_id, INT32 status, void* pv_tag) {
-    (void)conn_id; (void)status;
+    (void)conn_id; (void)status; (void)pv_tag;
 }
 
 /* --- GATTC Callbacks (all 16 slots must be filled) --- */
 
 static void gattc_event_cb(BT_GATTC_EVENT_T event, void* pv_tag) {
-    (void)event;
+    (void)event; (void)pv_tag;
 }
 
 static void gattc_reg_client_cb(BT_GATTC_REG_CLIENT_RST_T *rst, void* pv_tag) {
+    (void)pv_tag;
     printf("[GATTC] Client registered: client_if=%d\n", rst->client_if);
     g_client_if = rst->client_if;
 }
 
 static void gattc_generic_cb(void *rst, void* pv_tag) {
-    (void)rst;
+    (void)rst; (void)pv_tag;
 }
 
 /* --- Signal handlers --- */
 
 static void sighandler(int sig) {
+    (void)sig;
     g_running = 0;
 }
 
@@ -548,61 +506,65 @@ static void crash_handler(int sig) {
     else if (sig == SIGABRT) name = "SIGABRT";
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "\n*** CRASH: signal %d (%s) ***\n", sig, name);
-    write(STDERR_FILENO, buf, len);
+    (void)write(STDERR_FILENO, buf, len);
     _exit(128 + sig);
 }
 
-/* --- Main --- */
+/* --- BT stack init/reinit --- */
 
-#define LOAD_SYM(handle, type, name) \
+#define LOAD_SYM_RET(handle, type, name, retval) \
     type name = (type)dlsym(handle, #name); \
-    if (!name) { fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror()); return 1; }
+    if (!name) { fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror()); return retval; }
 
-int main(int argc, char *argv[]) {
+static int bt_init(void) {
     INT32 ret;
 
-    signal(SIGINT, sighandler);
-    signal(SIGTERM, sighandler);
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGSEGV, crash_handler);
-    signal(SIGBUS, crash_handler);
-    signal(SIGABRT, crash_handler);
-
-    setbuf(stdout, NULL);
-    printf("=== Kobo BLE Peripheral ===\n");
+    /* Reset state */
+    g_server_if = -1;
+    g_client_if = -1;
+    g_srvc_handle = -1;
+    g_char_handle = -1;
+    g_descr_handle = -1;
+    g_conn_id = -1;
+    g_srvc_started = -1;
+    g_health_fail = 0;
+    g_send_response = NULL;
+    g_stop_service = NULL;
+    g_start_adv_set = NULL;
+    g_stop_adv_set = NULL;
+    g_multi_adv_enable = NULL;
+    g_multi_adv_setdata = NULL;
+    g_multi_adv_disable = NULL;
 
     /* Load the client library */
-    void *lib = dlopen("libmtk_bt_service_client.so", RTLD_NOW);
-    if (!lib) {
+    g_lib = dlopen("libmtk_bt_service_client.so", RTLD_NOW);
+    if (!g_lib) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
-        fprintf(stderr, "Try: LD_LIBRARY_PATH=/usr/lib %s\n", argv[0]);
-        return 1;
+        return -1;
     }
 
     /* Load all function pointers */
-    LOAD_SYM(lib, fn_service_init, a_mtk_bt_service_init);
-    LOAD_SYM(lib, fn_rpc_init, c_rpc_init_mtk_bt_service_client);
-    LOAD_SYM(lib, fn_rpc_start, c_rpc_start_mtk_bt_service_client);
-    LOAD_SYM(lib, fn_gattc_base_init, a_mtkapi_bt_gattc_base_init);
-    LOAD_SYM(lib, fn_gatts_base_init, a_mtkapi_bt_gatts_base_init);
-    LOAD_SYM(lib, fn_gatts_register_server, a_mtkapi_bt_gatts_register_server);
-    LOAD_SYM(lib, fn_gatts_unregister_server, a_mtkapi_bt_gatts_unregister_server);
-    LOAD_SYM(lib, fn_gatts_add_service, a_mtkapi_bt_gatts_add_service);
-    LOAD_SYM(lib, fn_gatts_add_char, a_mtkapi_bt_gatts_add_char);
-    LOAD_SYM(lib, fn_gatts_add_desc, a_mtkapi_bt_gatts_add_desc);
-    LOAD_SYM(lib, fn_gatts_start_service, a_mtkapi_bt_gatts_start_service);
-    LOAD_SYM(lib, fn_gatts_stop_service, a_mtkapi_bt_gatts_stop_service);
-    LOAD_SYM(lib, fn_gatts_send_response, a_mtkapi_bt_gatts_send_response);
-    LOAD_SYM(lib, fn_gattc_register_app, a_mtkapi_bt_gattc_register_app);
-    LOAD_SYM(lib, fn_gattc_multi_adv_enable, a_mtkapi_bt_gattc_multi_adv_enable);
-    LOAD_SYM(lib, fn_gattc_multi_adv_setdata, a_mtkapi_bt_gattc_multi_adv_setdata);
-    LOAD_SYM(lib, fn_gattc_multi_adv_disable, a_mtkapi_bt_gattc_multi_adv_disable);
-    LOAD_SYM(lib, fn_gattc_start_adv_set, a_mtkapi_bt_gattc_start_advertising_set);
-    LOAD_SYM(lib, fn_gattc_stop_adv_set, a_mtkapi_bt_gattc_stop_advertising_set);
+    LOAD_SYM_RET(g_lib, fn_service_init, a_mtk_bt_service_init, -1);
+    LOAD_SYM_RET(g_lib, fn_rpc_init, c_rpc_init_mtk_bt_service_client, -1);
+    LOAD_SYM_RET(g_lib, fn_rpc_start, c_rpc_start_mtk_bt_service_client, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_base_init, a_mtkapi_bt_gattc_base_init, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_base_init, a_mtkapi_bt_gatts_base_init, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_register_server, a_mtkapi_bt_gatts_register_server, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_add_service, a_mtkapi_bt_gatts_add_service, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_add_char, a_mtkapi_bt_gatts_add_char, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_add_desc, a_mtkapi_bt_gatts_add_desc, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_start_service, a_mtkapi_bt_gatts_start_service, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_stop_service, a_mtkapi_bt_gatts_stop_service, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_send_response, a_mtkapi_bt_gatts_send_response, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_register_app, a_mtkapi_bt_gattc_register_app, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_multi_adv_enable, a_mtkapi_bt_gattc_multi_adv_enable, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_multi_adv_setdata, a_mtkapi_bt_gattc_multi_adv_setdata, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_multi_adv_disable, a_mtkapi_bt_gattc_multi_adv_disable, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_start_adv_set, a_mtkapi_bt_gattc_start_advertising_set, -1);
+    LOAD_SYM_RET(g_lib, fn_gattc_stop_adv_set, a_mtkapi_bt_gattc_stop_advertising_set, -1);
 
     g_send_response = a_mtkapi_bt_gatts_send_response;
     g_stop_service = a_mtkapi_bt_gatts_stop_service;
-    g_start_service = a_mtkapi_bt_gatts_start_service;
     g_start_adv_set = a_mtkapi_bt_gattc_start_advertising_set;
     g_stop_adv_set = a_mtkapi_bt_gattc_stop_advertising_set;
     g_multi_adv_enable = a_mtkapi_bt_gattc_multi_adv_enable;
@@ -612,11 +574,9 @@ int main(int argc, char *argv[]) {
     /* Initialize RPC connection to btservice */
     ret = a_mtk_bt_service_init();
     printf("service_init: ret=%d\n", ret);
-    sleep(3);
 
-    ret = c_rpc_init_mtk_bt_service_client();
-    ret = c_rpc_start_mtk_bt_service_client();
-    sleep(2);
+    c_rpc_init_mtk_bt_service_client();
+    c_rpc_start_mtk_bt_service_client();
 
     /* Initialize GATTC callbacks (all 16 slots) */
     MTKRPCAPI_BT_APP_GATTC_CB_FUNC_T gattc_cbs;
@@ -640,7 +600,6 @@ int main(int argc, char *argv[]) {
 
     ret = a_mtkapi_bt_gattc_base_init(&gattc_cbs, NULL);
     printf("gattc_base_init: ret=%d\n", ret);
-    sleep(1);
 
     /* Initialize GATTS callbacks */
     MTKRPCAPI_BT_APP_GATTS_CB_FUNC_T gatts_cbs = {
@@ -658,72 +617,144 @@ int main(int argc, char *argv[]) {
 
     ret = a_mtkapi_bt_gatts_base_init(&gatts_cbs, NULL);
     printf("gatts_base_init: ret=%d\n", ret);
-    sleep(1);
 
-    /* Register GATTC app (for advertising) */
-    ret = a_mtkapi_bt_gattc_register_app("d3f8a120-5c6e-4a93-b8d2-9e7f01234abc");
-    printf("gattc_register_app: ret=%d\n", ret);
-    sleep(3);
-
-    if (g_client_if < 0) {
-        fprintf(stderr, "WARNING: client_if not received, using 0\n");
-        g_client_if = 0;
+    /* Register GATTC app — retry until RPC transport is ready
+     * (no ready callback exposed by the RPC layer) */
+    for (int attempt = 1; ; attempt++) {
+        ret = a_mtkapi_bt_gattc_register_app("d3f8a120-5c6e-4a93-b8d2-9e7f01234abc");
+        if (ret == 0) break;
+        if (attempt >= 30) {
+            fprintf(stderr, "gattc_register_app failed after %d attempts (ret=%d)\n", attempt, ret);
+            break;
+        }
+        usleep(200000);
     }
+    printf("gattc_register_app: ret=%d\n", ret);
+    if (!wait_for(&g_client_if, 3000))
+        fprintf(stderr, "WARNING: client_if not received, using 0\n");
+
+    if (g_client_if < 0)
+        g_client_if = 0;
 
     /* Register GATT server */
     ret = a_mtkapi_bt_gatts_register_server(SERVICE_UUID);
     printf("gatts_register_server: ret=%d\n", ret);
-    sleep(3);
-
-    if (g_server_if < 0) {
+    if (!wait_for(&g_server_if, 3000))
         fprintf(stderr, "GATTS register failed. Continuing with advertising only.\n");
-    }
 
     /* Set up GATT service: service + characteristic + CCCD */
     if (g_server_if >= 0) {
-        ret = a_mtkapi_bt_gatts_add_service(g_server_if, SERVICE_UUID, 1, 4);
-        sleep(1);
+        a_mtkapi_bt_gatts_add_service(g_server_if, SERVICE_UUID, 1, 4);
+        wait_for(&g_srvc_handle, 2000);
 
         if (g_srvc_handle >= 0) {
             a_mtkapi_bt_gatts_add_char(g_server_if, g_srvc_handle, CHAR_PAGE_UUID,
                                         GATT_PROP_READ | GATT_PROP_WRITE | GATT_PROP_NOTIFY,
                                         GATT_PERM_READ | GATT_PERM_WRITE);
-            sleep(1);
+            wait_for(&g_char_handle, 2000);
 
             a_mtkapi_bt_gatts_add_desc(g_server_if, g_srvc_handle, CCCD_UUID,
                                         GATT_PERM_READ | GATT_PERM_WRITE);
-            sleep(1);
+            wait_for(&g_descr_handle, 2000);
 
             a_mtkapi_bt_gatts_start_service(g_server_if, g_srvc_handle, 2);
-            sleep(1);
+            wait_for(&g_srvc_started, 2000);
         }
     }
 
-    /* Start legacy BLE advertising (ADV_IND - visible to Apple Watch) */
+    /* Start legacy BLE advertising */
     start_legacy_advertising();
 
     printf("\n=== BLE Peripheral running ===\n");
     printf("Service UUID: %s\n", SERVICE_UUID);
     printf("Char UUID:    %s\n", CHAR_PAGE_UUID);
-    printf("Press Ctrl+C to stop\n\n");
+    printf("Socket:       %s\n", SOCKET_PATH);
+    return 0;
+}
 
-    /* Start power button monitor thread for sleep/wake */
-    pthread_t pwr_thread;
-    pthread_create(&pwr_thread, NULL, power_button_monitor, NULL);
+/* --- Main --- */
 
-    /* Wait for signal */
-    while (g_running)
-        sleep(1);
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
 
-    /* Cleanup */
-    printf("\nShutting down...\n");
-    a_mtkapi_bt_gattc_stop_advertising_set(g_client_if);
-    if (g_server_if >= 0) {
-        a_mtkapi_bt_gatts_stop_service(g_server_if, g_srvc_handle);
-        a_mtkapi_bt_gatts_unregister_server(g_server_if);
+    /* Use sigaction without SA_RESTART so blocking read() gets EINTR */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sighandler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGBUS, crash_handler);
+    signal(SIGABRT, crash_handler);
+
+    setbuf(stdout, NULL);
+    printf("=== Kobo BLE Peripheral ===\n");
+
+    if (bt_init() != 0) {
+        fprintf(stderr, "BT init failed\n");
+        return 1;
     }
 
-    dlclose(lib);
+    /* Block on socket — plugin sends CMD_HEALTH_CHECK on resume */
+    while (g_running) {
+        if (g_sock_fd < 0) {
+            /* Connect to plugin socket */
+            g_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (g_sock_fd < 0) {
+                printf("[SOCK] socket: %s\n", strerror(errno));
+                sleep(1);
+                continue;
+            }
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+            if (connect(g_sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                printf("[SOCK] connect: %s\n", strerror(errno));
+                close(g_sock_fd);
+                g_sock_fd = -1;
+                sleep(1);
+                continue;
+            }
+            printf("[SOCK] connected to plugin\n");
+        }
+
+        unsigned char cmd;
+        ssize_t n = read(g_sock_fd, &cmd, 1);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            printf("[SOCK] plugin disconnected\n");
+            close(g_sock_fd);
+            g_sock_fd = -1;
+            continue;
+        }
+
+        if (cmd == CMD_HEALTH_CHECK) {
+            printf("[HEALTH] Health check received, testing BT stack...\n");
+            /* Try re-advertising — if the stack is stale this will fail or hang */
+            INT32 ret = start_legacy_advertising();
+            if (ret != 0) {
+                printf("[HEALTH] BT stack stale (adv ret=%d) — exiting for respawn\n", ret);
+                g_health_fail = 1;
+                g_running = 0;
+            } else {
+                printf("[HEALTH] BT stack OK\n");
+            }
+        }
+    }
+
+    /* Cleanup */
+    int exit_code = g_health_fail ? EXIT_HEALTH_FAIL : 0;
+    printf("\nShutting down (exit code %d)...\n", exit_code);
+    if (g_sock_fd >= 0)
+        close(g_sock_fd);
+    if (g_stop_adv_set && g_client_if >= 0)
+        g_stop_adv_set(g_client_if);
+    if (g_server_if >= 0 && g_stop_service)
+        g_stop_service(g_server_if, g_srvc_handle);
+    if (g_lib)
+        dlclose(g_lib);
     printf("Done.\n");
-    return 0;
+    return exit_code;
 }

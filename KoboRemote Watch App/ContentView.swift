@@ -1,4 +1,8 @@
 import SwiftUI
+import WatchKit
+import os
+
+private let logger = Logger(subsystem: "com.koboremote.watchapp", category: "UI")
 
 struct ContentView: View {
     var ble = BLEManager.shared
@@ -21,56 +25,50 @@ struct ContentView: View {
             if let action = ble.lastAction {
                 Text(action)
                     .font(.title3)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(actionColor(action))
                     .transition(.opacity)
-            }
-
-            Spacer()
-
-            // Page turn buttons
-            HStack(spacing: 20) {
-                Button {
-                    ble.sendPreviousPage()
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.title2)
-                        .frame(maxWidth: .infinity, minHeight: 50)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
-                .disabled(ble.state != .connected)
-
-                Button {
-                    ble.sendNextPage()
-                } label: {
-                    Image(systemName: "chevron.right")
-                        .font(.title2)
-                        .frame(maxWidth: .infinity, minHeight: 50)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
-                .disabled(ble.state != .connected)
             }
         }
         .padding()
         .animation(.easeInOut(duration: 0.2), value: ble.lastAction)
-        .focusable()
-        .digitalCrownRotation($crownValue, from: -1000, through: 1000, sensitivity: .low, isContinuous: true)
+        .focusable(true)
+        .digitalCrownRotation($crownValue, from: -1000, through: 1000, sensitivity: .low, isContinuous: true, isHapticFeedbackEnabled: false)
         .onChange(of: actionState.triggered) {
             if actionState.triggered {
-                ble.sendNextPage()
+                if ble.isConnected {
+                    ble.sendNextPage()
+                    WKInterfaceDevice.current().play(.success)
+                } else {
+                    WKInterfaceDevice.current().play(.start)
+                    ble.sendNextPage() { success in
+                        WKInterfaceDevice.current().play(success ? .success : .failure)
+                    }
+                }
             }
         }
         .onChange(of: crownValue) {
-            let tick = Int(crownValue)
+            let tick = Int(crownValue / 5)
             if tick != lastCrownTick {
-                if tick > lastCrownTick {
-                    ble.sendNextPage()
-                } else {
-                    ble.sendPreviousPage()
-                }
+                let send = tick > lastCrownTick ? ble.sendNextPage : ble.sendPreviousPage
                 lastCrownTick = tick
+                if ble.isConnected {
+                    send { _ in }
+                    WKInterfaceDevice.current().play(.success)
+                } else {
+                    WKInterfaceDevice.current().play(.start)
+                    send { success in
+                        WKInterfaceDevice.current().play(success ? .success : .failure)
+                    }
+                }
             }
+        }
+    }
+
+    private func actionColor(_ action: String) -> Color {
+        switch action {
+        case "Connecting…": .yellow
+        case "Failed": .red
+        default: .green
         }
     }
 
