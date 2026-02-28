@@ -53,6 +53,8 @@ static QObject *(*PowerManager_sharedInstance)();
 static int (*PowerManager_filter)(QObject *, QObject *, QEvent *);
 static QEvent::Type (*TimeEvent_eventType)();
 
+static QObject *(*N3PowerWorkflowManager_sharedInstance)();
+
 /* Original turnBluetoothOn — stored by nh_hook */
 static void (*orig_turnBluetoothOn)(void *);
 
@@ -146,7 +148,7 @@ static void spawn_ble_peripheral()
 
     if (pid == 0) {
         /* Redirect stdout/stderr to log file, then exec */
-        int fd = open("/tmp/ble_peripheral.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = open("/tmp/ble_peripheral.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);
@@ -359,14 +361,17 @@ static int ble_remote_init()
 {
     nh_log("init: starting");
 
-    /* Connect to PowerManager::resumed() for resume detection */
-    QObject *pm = PowerManager_sharedInstance();
-    if (pm) {
-        ResumeHandler *rh = new ResumeHandler();
-        QObject::connect(pm, SIGNAL(resumed()), rh, SLOT(onResume()));
-        nh_log("connected to PowerManager::resumed()");
+    /* Connect to N3PowerWorkflowManager::resumedFromSleep() for resume detection.
+     * This fires after the UI is back up (not during kernel resume like
+     * PowerManager::resumed()), so the BT stack is ready by then. */
+    ResumeHandler *rh = new ResumeHandler();
+
+    QObject *pwm = N3PowerWorkflowManager_sharedInstance();
+    if (pwm) {
+        bool ok = QObject::connect(pwm, SIGNAL(resumedFromSleep()), rh, SLOT(onResume()));
+        nh_log("N3PowerWorkflowManager::resumedFromSleep() connect: %s", ok ? "OK" : "FAILED");
     } else {
-        nh_log("WARNING: no PowerManager for resume detection");
+        nh_log("WARNING: no N3PowerWorkflowManager for resume detection");
     }
 
     /* Start socket server thread */
@@ -443,6 +448,11 @@ static struct nh_dlsym ble_remote_dlsym[] = {
         .name = "_ZN9TimeEvent9eventTypeEv",
         .out  = nh_symoutptr(TimeEvent_eventType),
         .desc = "TimeEvent::eventType()",
+    },
+    {
+        .name = "_ZN22N3PowerWorkflowManager14sharedInstanceEv",
+        .out  = nh_symoutptr(N3PowerWorkflowManager_sharedInstance),
+        .desc = "N3PowerWorkflowManager::sharedInstance()",
     },
     {0},
 };

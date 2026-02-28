@@ -26,6 +26,8 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
+#include <fcntl.h>
 
 /* Type definitions matching MediaTek BT MW */
 typedef unsigned char  UINT8;
@@ -304,6 +306,16 @@ static void *g_lib = NULL;
 #define SOCKET_PATH "/tmp/kobo-ble-remote.sock"
 static int g_sock_fd = -1;
 
+/* Self-pipe for waking main loop from callbacks */
+static int g_wakeup_pipe[2] = { -1, -1 };
+
+static void wakeup_main_loop(void) {
+    if (g_wakeup_pipe[1] >= 0) {
+        char c = 1;
+        (void)write(g_wakeup_pipe[1], &c, 1);
+    }
+}
+
 /* --- Socket IPC to NickelHook plugin --- */
 
 static void send_command(UINT8 cmd) {
@@ -339,11 +351,14 @@ static void build_scan_rsp(struct AdvSetData *sr) {
     sr->len = (INT32)(p - sr->data);
 }
 
+static volatile int g_client_if_confirmed = 0; /* set when callback fires */
+
 static INT32 start_legacy_advertising(void) {
     if (g_client_if < 0) return -1;
     INT32 ret;
 
-    if (g_multi_adv_enable) {
+    /* Only prime if we have a callback-confirmed client_if */
+    if (g_multi_adv_enable && g_client_if_confirmed) {
         printf("Priming with multi_adv (client_if=%d)...\n", g_client_if);
         ret = g_multi_adv_enable(g_client_if, 96, 160, 0, 7, 7, 0);
         printf("multi_adv_enable: ret=%d\n", ret);
@@ -381,24 +396,44 @@ static INT32 start_legacy_advertising(void) {
     struct PeriodicAdvParams pp;
     memset(&pp, 0, sizeof(pp));
 
+    /* Try advertising with current client_if, then scan 0..7 on failure.
+     * After respawn, the original client_if may still be valid in btservice
+     * even though re-registration failed. */
     printf("Starting legacy advertising (client_if=%d)...\n", g_client_if);
     ret = g_start_adv_set(g_client_if, &ap, &ad, &sr, &pp, &pd, 0, 0);
+    if (ret != 0) {
+        for (INT32 try_if = 0; try_if <= 7 && ret != 0; try_if++) {
+            if (try_if == g_client_if) continue;
+            printf("Retrying advertising with client_if=%d...\n", try_if);
+            ret = g_start_adv_set(try_if, &ap, &ad, &sr, &pp, &pd, 0, 0);
+            if (ret == 0) {
+                g_client_if = try_if;
+                printf("Advertising succeeded with client_if=%d\n", try_if);
+            }
+        }
+    }
     printf("start_advertising_set: ret=%d\n", ret);
     return ret;
 }
 
 /* --- GATTS Callbacks --- */
 
+static volatile int g_need_readvertise = 0;
+
 static void gatts_event_cb(BT_GATTS_EVENT_T event, void* pv_tag) {
     (void)pv_tag;
     printf("[GATTS] Event: %d\n", event);
     if (event == BT_GATTS_CONNECT) {
         printf("[GATTS] *** Device connected! ***\n");
+        /* Signal main thread to restart advertising — can't call BT
+         * middleware from within an RPC callback (deadlock). */
+        g_need_readvertise = 1;
+        wakeup_main_loop();
     } else if (event == BT_GATTS_DISCONNECT) {
         printf("[GATTS] *** Device disconnected ***\n");
         g_conn_id = -1;
-        printf("[GATTS] Restarting advertising...\n");
-        start_legacy_advertising();
+        g_need_readvertise = 1;
+        wakeup_main_loop();
     }
 }
 
@@ -486,6 +521,7 @@ static void gattc_reg_client_cb(BT_GATTC_REG_CLIENT_RST_T *rst, void* pv_tag) {
     (void)pv_tag;
     printf("[GATTC] Client registered: client_if=%d\n", rst->client_if);
     g_client_if = rst->client_if;
+    g_client_if_confirmed = 1;
 }
 
 static void gattc_generic_cb(void *rst, void* pv_tag) {
@@ -528,6 +564,7 @@ static int bt_init(void) {
     g_conn_id = -1;
     g_srvc_started = -1;
     g_health_fail = 0;
+    g_client_if_confirmed = 0;
     g_send_response = NULL;
     g_stop_service = NULL;
     g_start_adv_set = NULL;
@@ -630,11 +667,15 @@ static int bt_init(void) {
         usleep(200000);
     }
     printf("gattc_register_app: ret=%d\n", ret);
-    if (!wait_for(&g_client_if, 3000))
-        fprintf(stderr, "WARNING: client_if not received, using 0\n");
+    if (ret == 0 && !wait_for(&g_client_if, 3000))
+        fprintf(stderr, "WARNING: client_if callback not received\n");
 
-    if (g_client_if < 0)
-        g_client_if = 0;
+    if (g_client_if < 0) {
+        /* Registration fails after first use per btservice lifetime.
+         * Try known client_if values (5 is first assigned on fresh boot). */
+        fprintf(stderr, "WARNING: trying client_if 5..7 for advertising\n");
+        g_client_if = 5;
+    }
 
     /* Register GATT server */
     ret = a_mtkapi_bt_gatts_register_server(SERVICE_UUID);
@@ -691,12 +732,21 @@ int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     printf("=== Kobo BLE Peripheral ===\n");
 
+    if (pipe(g_wakeup_pipe) < 0) {
+        perror("pipe");
+        return 1;
+    }
+    fcntl(g_wakeup_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(g_wakeup_pipe[1], F_SETFL, O_NONBLOCK);
+
     if (bt_init() != 0) {
         fprintf(stderr, "BT init failed\n");
         return 1;
     }
 
-    /* Block on socket — plugin sends CMD_HEALTH_CHECK on resume */
+    /* Main loop: block on socket, handle commands and readvertise flag.
+     * The readvertise flag is set by GATTS callbacks (which can't call
+     * BT middleware directly without deadlocking the RPC thread). */
     while (g_running) {
         if (g_sock_fd < 0) {
             /* Connect to plugin socket */
@@ -720,6 +770,36 @@ int main(int argc, char *argv[]) {
             printf("[SOCK] connected to plugin\n");
         }
 
+        /* Check if a callback requested re-advertising */
+        if (g_need_readvertise) {
+            g_need_readvertise = 0;
+            printf("[ADV] Restarting advertising (requested by callback)\n");
+            start_legacy_advertising();
+        }
+
+        /* Block on both socket and wakeup pipe — no timeout, no battery drain */
+        struct pollfd pfds[2] = {
+            { .fd = g_sock_fd, .events = POLLIN },
+            { .fd = g_wakeup_pipe[0], .events = POLLIN },
+        };
+        int pret = poll(pfds, 2, -1);
+        if (pret < 0) {
+            if (errno == EINTR) continue;
+            printf("[SOCK] poll error: %s\n", strerror(errno));
+            close(g_sock_fd);
+            g_sock_fd = -1;
+            continue;
+        }
+
+        /* Drain wakeup pipe */
+        if (pfds[1].revents & POLLIN) {
+            char drain[16];
+            (void)read(g_wakeup_pipe[0], drain, sizeof(drain));
+            continue; /* loop back to check g_need_readvertise */
+        }
+
+        if (!(pfds[0].revents & POLLIN)) continue;
+
         unsigned char cmd;
         ssize_t n = read(g_sock_fd, &cmd, 1);
         if (n <= 0) {
@@ -731,15 +811,16 @@ int main(int argc, char *argv[]) {
         }
 
         if (cmd == CMD_HEALTH_CHECK) {
-            printf("[HEALTH] Health check received, testing BT stack...\n");
-            /* Try re-advertising — if the stack is stale this will fail or hang */
+            printf("[HEALTH] Health check received, waiting for BT stack...\n");
+            sleep(2);
+            printf("[HEALTH] Restarting advertising...\n");
             INT32 ret = start_legacy_advertising();
-            if (ret != 0) {
-                printf("[HEALTH] BT stack stale (adv ret=%d) — exiting for respawn\n", ret);
+            if (ret == 0) {
+                printf("[HEALTH] Advertising restarted OK\n");
+            } else {
+                printf("[HEALTH] Advertising failed (ret=%d) — exiting for respawn\n", ret);
                 g_health_fail = 1;
                 g_running = 0;
-            } else {
-                printf("[HEALTH] BT stack OK\n");
             }
         }
     }
