@@ -7,7 +7,9 @@ Page turning remotes are great, but why buy a new thing to lose if you already h
 Simply  turn the crown to change pages, or use a pinch gesture on supported devices (Series 10 or newer). You'll get some gentle haptic feedback so you can manage all this without looking at your watch (or taking it out from under the covers).
 
 
-## Compatibility
+## Limitations
+
+This app is very much in beta. I had to reverse engineer a fair amount of Kobo Bluetooth code, and there may still be bugs. Please file an issue if you hit something! 
 
 The Kobo code was built for MediaTek-based devices (Clara BW/Colour, Libra Colour, Elipsa 2E) and will not work on others. It probably would be straight forward to implement for older devices, but I do not have one around to build/test on.
 
