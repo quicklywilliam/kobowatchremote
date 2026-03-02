@@ -25,9 +25,27 @@ struct ContentView: View {
             if let action = ble.lastAction {
                 Text(action)
                     .font(.title3)
-                    .foregroundStyle(actionColor(action))
+                    .foregroundStyle(statusColor)
                     .transition(.opacity)
             }
+        }
+        .background {
+            Button {
+                if ble.isConnected {
+                    ble.sendNextPage()
+                    WKInterfaceDevice.current().play(.success)
+                } else {
+                    WKInterfaceDevice.current().play(.start)
+                    ble.sendNextPage { success in
+                        WKInterfaceDevice.current().play(success ? .success : .failure)
+                    }
+                }
+            } label: {
+                EmptyView()
+            }
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .handGestureShortcut(.primaryAction)
         }
         .padding()
         .animation(.easeInOut(duration: 0.2), value: ble.lastAction)
@@ -64,14 +82,6 @@ struct ContentView: View {
         }
     }
 
-    private func actionColor(_ action: String) -> Color {
-        switch action {
-        case "Connecting…": .yellow
-        case "Failed": .red
-        default: .green
-        }
-    }
-
     private var statusColor: Color {
         switch ble.state {
         case .connected: .green
@@ -81,6 +91,23 @@ struct ContentView: View {
     }
 }
 
-#Preview {
-    ContentView()
+#if DEBUG
+#Preview("Connected") {
+    ContentView(ble: .preview(state: .connected))
 }
+#Preview("Connected + Action") {
+    ContentView(ble: .preview(state: .connected, lastAction: "Next →"))
+}
+#Preview("Scanning") {
+    ContentView(ble: .preview(state: .scanning))
+}
+#Preview("Disconnected") {
+    ContentView(ble: .preview(state: .disconnected))
+}
+#Preview("Connecting…") {
+    ContentView(ble: .preview(state: .connecting, lastAction: "Next →"))
+}
+#Preview("Failed") {
+    ContentView(ble: .preview(state: .disconnected, lastAction: "Failed"))
+}
+#endif

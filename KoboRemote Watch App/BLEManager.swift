@@ -35,6 +35,18 @@ final class BLEManager: NSObject {
         centralManager = CBCentralManager(delegate: self, queue: nil)
     }
 
+    #if DEBUG
+    private init(previewState: ConnectionState, previewAction: String?) {
+        super.init()
+        state = previewState
+        lastAction = previewAction
+    }
+
+    static func preview(state: ConnectionState, lastAction: String? = nil) -> BLEManager {
+        BLEManager(previewState: state, previewAction: lastAction)
+    }
+    #endif
+
     var isConnected: Bool { state == .connected }
 
     func sendNextPage(completion: ((Bool) -> Void)? = nil) {
@@ -46,14 +58,14 @@ final class BLEManager: NSObject {
     }
 
     private func sendCommand(_ command: UInt8, label: String, completion: ((Bool) -> Void)?) {
+        lastAction = label
+        
         if let peripheral, let characteristic {
             peripheral.writeValue(Data([command]), for: characteristic, type: .withResponse)
-            lastAction = label
             clearAction()
             completion?(true)
         } else {
             // Queue command and attempt reconnect
-            lastAction = "Connecting…"
             pendingCommand = (command, label, completion)
             attemptReconnectWithTimeout()
         }
