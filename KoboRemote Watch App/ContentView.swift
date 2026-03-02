@@ -35,7 +35,6 @@ struct ContentView: View {
                     ble.sendNextPage()
                     WKInterfaceDevice.current().play(.success)
                 } else {
-                    WKInterfaceDevice.current().play(.start)
                     ble.sendNextPage { success in
                         WKInterfaceDevice.current().play(success ? .success : .failure)
                     }
@@ -57,7 +56,6 @@ struct ContentView: View {
                     ble.sendNextPage()
                     WKInterfaceDevice.current().play(.success)
                 } else {
-                    WKInterfaceDevice.current().play(.start)
                     ble.sendNextPage() { success in
                         WKInterfaceDevice.current().play(success ? .success : .failure)
                     }
